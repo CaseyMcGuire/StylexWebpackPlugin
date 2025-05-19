@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "alwaysStrict": true,
+    "baseUrl": "src",
+    "noImplicitReturns": true,
+    "noImplicitThis": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "allowJs": false,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+  }
+}
