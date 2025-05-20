@@ -1,6 +1,6 @@
 {
-  "name": "stylex-webpack-plugin",
-  "version": "1.0.0",
+  "name": "@caseyjaymcguire/stylex-webpack-plugin",
+  "version": "0.0.1",
   "description": "A Webpack plugin for Stylex",
   "main": "index.js",
   "scripts": {
