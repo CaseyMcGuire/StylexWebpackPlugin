@@ -16,17 +16,15 @@ const IS_DEV_ENV =
 
 const { RawSource, ConcatSource } = webpack.sources;
 
+
 class StylexPlugin {
-  // Store rules by chunk name/id instead of globally
-  stylexRulesByChunk = {};
+  stylexRules = {};
   filesInLastRun = null;
-  // Map files to their chunks for organization
-  fileToChunkMap = {};
 
   constructor({
                 dev = IS_DEV_ENV,
                 appendTo,
-                filename = appendTo == null ? '[name].stylex.css' : undefined, // Use [name] token to include chunk name
+                filename = appendTo == null ? '[name].stylex.css' : undefined,
                 stylexImports = ['stylex', '@stylexjs/stylex'],
                 unstable_moduleResolution = { type: 'commonJS', rootDir: process.cwd() },
                 babelConfig: { plugins = [], presets = [], babelrc = false } = {},
@@ -34,7 +32,6 @@ class StylexPlugin {
                 ...options
               } /*: PluginOptions */ = {}) {
     this.dev = dev;
-    this.appendTo = appendTo;
     this.filename = filename;
     this.babelConfig = { plugins, presets, babelrc };
     this.stylexImports = stylexImports;
@@ -51,14 +48,6 @@ class StylexPlugin {
   }
 
   apply(compiler) {
-
-    compiler.hooks.beforeCompile.tap(PLUGIN_NAME, (params) => {
-      // Reset the data structures to prevent memory leaks
-      this.stylexRulesByChunk = {};
-      this.fileToChunkMap = {};
-      this.filesInLastRun = null;
-    });
-
     compiler.hooks.make.tap(PLUGIN_NAME, (compilation) => {
       // Apply loader to JS modules.
       NormalModule.getCompilationHooks(compilation).loader.tap(
@@ -79,166 +68,139 @@ class StylexPlugin {
         },
       );
 
-      // Track which files belong to which chunks
-      compilation.hooks.buildModule.tap(PLUGIN_NAME, (module) => {
-        if (module.resource) {
-          // Initialize empty array for this file if it doesn't exist
-          this.fileToChunkMap[module.resource] = [];
-        }
-      });
-
-      // Map modules to chunks when chunks are created
-      compilation.hooks.chunkAsset.tap(PLUGIN_NAME, (chunk, filename) => {
-        // Find all modules in this chunk
-        for (const module of chunk.getModules()) {
-          if (module.resource && this.fileToChunkMap[module.resource]) {
-            // Add this chunk to the file's chunks if not already there
-            if (!this.fileToChunkMap[module.resource].includes(chunk.name || chunk.id)) {
-              this.fileToChunkMap[module.resource].push(chunk.name || chunk.id);
-            }
-          }
-        }
-      });
-
       // Make a list of all modules that were included in the last compilation.
       // This might need to be tweaked if not all files are included after a change
       compilation.hooks.finishModules.tap(PLUGIN_NAME, (modules) => {
         this.filesInLastRun = [...modules.values()].map((m) => m.resource);
       });
 
-      // Group rules by chunk and return processed CSS for each chunk
-      const getStyleXRulesByChunk = () => {
-        // Initialize an object to store rules by chunk
-        const rulesByChunk = {};
+      compilation.hooks.afterOptimizeChunks.tap(PLUGIN_NAME, (chunks) => {
+        // --- CHANGED PROPERTY NAME AND LOGIC ---
+        this.fileToBundlesMap = {}; // Reset map for each compilation
 
-        // Go through each file that has StyleX rules
-        for (const filename of Object.keys(this.stylexRulesByChunk)) {
-          // Skip files that weren't in last compilation
-          if (this.filesInLastRun && !this.filesInLastRun.includes(filename)) {
-            continue;
-          }
+        for (const chunk of chunks) {
+          const chunkName = chunk.name || chunk.id?.toString() || `chunk-${chunk.renderedHash}`;
+          if (!chunkName) continue; // Should always have a name/id/hash
+          for (const module of compilation.chunkGraph.getChunkModules(chunk)) {
+            if (module.resource) {
+              const filePath = module.resource;
+              const isNodeModule = filePath.includes(path.sep + 'node_modules' + path.sep);
 
-          // Get the chunks this file belongs to
-          const chunks = this.fileToChunkMap[filename] || ['main']; // Default to 'main' if no chunk info
-
-          // Add this file's rules to each chunk it belongs to
-          for (const chunkName of chunks) {
-            if (!rulesByChunk[chunkName]) {
-              rulesByChunk[chunkName] = [];
-            }
-            rulesByChunk[chunkName].push(...this.stylexRulesByChunk[filename]);
-          }
-        }
-
-        // Process rules for each chunk
-        const cssPerChunk = {};
-        for (const [chunkName, rules] of Object.entries(rulesByChunk)) {
-          if (rules.length > 0) {
-            cssPerChunk[chunkName] = stylexBabelPlugin.processStylexRules(
-              rules,
-              this.useCSSLayers
-            );
-          }
-        }
-        return cssPerChunk;
-      };
-
-      if (this.appendTo) {
-        compilation.hooks.processAssets.tap(
-          {
-            name: PLUGIN_NAME,
-            stage: Compilation.PROCESS_ASSETS_STAGE_PRE_PROCESS,
-          },
-          (assets) => {
-            // Get CSS rules grouped by chunk
-            const cssPerChunk = getStyleXRulesByChunk();
-
-            // For each chunk that has CSS
-            for (const [chunkName, chunkCSS] of Object.entries(cssPerChunk)) {
-              if (!chunkCSS) continue;
-
-              // Try to find a matching CSS file for this chunk
-              const chunkPattern = new RegExp(`${chunkName}.*${this.appendTo}`);
-              const cssFileName = Object.keys(assets).find(filename =>
-                chunkPattern.test(filename) ||
-                (typeof this.appendTo === 'function' && this.appendTo(filename))
-              );
-
-              if (cssFileName) {
-                const cssAsset = assets[cssFileName];
-                assets[cssFileName] = new ConcatSource(
-                  cssAsset,
-                  new RawSource(chunkCSS),
-                );
+              if (!isNodeModule) {
+                if (!this.fileToBundlesMap[filePath]) {
+                  this.fileToBundlesMap[filePath] = [];
+                }
+                // Add bundle name to the file's list if not already present
+                if (!this.fileToBundlesMap[filePath].includes(chunkName)) {
+                  this.fileToBundlesMap[filePath].push(chunkName);
+                }
               }
             }
-          },
-        );
-      } else {
-        // We'll emit an asset ourselves with separate CSS file per chunk
-        const getContentHash = (source) => {
-          const { outputOptions } = compilation;
-          const { hashDigest, hashDigestLength, hashFunction, hashSalt } =
-            outputOptions;
-          const hash = compiler.webpack.util.createHash(hashFunction);
-
-          if (hashSalt) {
-            hash.update(hashSalt);
           }
+        }
+        // You can log it here for debugging if needed:
+        //console.log('File to Bundles Map (excluding node_modules):', this.fileToBundlesMap);
+      });
 
-          hash.update(source);
+      const getBundleToStylexRules = () => {
+        const { stylexRules } = this;
+        if (Object.keys(stylexRules).length === 0) {
+          return null;
+        }
+        // Take styles for the modules that were included in the last compilation.
 
-          const fullContentHash = hash.digest(hashDigest);
+        const bundleToRules = {};
+        for (const filename in stylexRules) {
+          const bundles = this.fileToBundlesMap[filename]
+          if (bundles == null) {
+            continue
+          }
+          for (const bundle of bundles) {
+            if (!bundleToRules[bundle]) {
+              bundleToRules[bundle] = []
+            }
+            bundleToRules[bundle].push(...stylexRules[filename])
+          }
+        }
 
-          return fullContentHash.toString().slice(0, hashDigestLength);
-        };
+        const bundleToProcessedRules = {}
+        for (const bundle in bundleToRules) {
+          bundleToProcessedRules[bundle] =
+            stylexBabelPlugin.processStylexRules(
+              bundleToRules[bundle],
+              this.useCSSLayers,
+            );
+        }
 
-        // Consume collected rules and emit stylex CSS assets for each chunk
-        compilation.hooks.processAssets.tap(
-          {
-            name: PLUGIN_NAME,
-            stage: Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
-          },
-          () => {
-            try {
-              // Get CSS organized by chunk
-              const cssPerChunk = getStyleXRulesByChunk();
+        return bundleToProcessedRules;
+      };
 
-              // Create a CSS file for each chunk
-              for (const [chunkName, chunkCSS] of Object.entries(cssPerChunk)) {
-                if (!chunkCSS) continue;
+      // We'll emit an asset ourselves. This comes with some complications in from Webpack.
+      // If the filename contains replacement tokens, like [contenthash], we need to
+      // process those tokens ourselves. Webpack does provide a way to reuse the configured
+      // hashing functions. We'll take advantage of that to process tokens.
+      const getContentHash = (source) => {
+        const { outputOptions } = compilation;
+        const { hashDigest, hashDigestLength, hashFunction, hashSalt } =
+          outputOptions;
+        const hash = compiler.webpack.util.createHash(hashFunction);
 
-                // Generate content hash for this chunk's CSS
-                const contentHash = getContentHash(chunkCSS);
+        if (hashSalt) {
+          hash.update(hashSalt);
+        }
 
-                // Create data for filename template processing
+        hash.update(source);
+
+        const fullContentHash = hash.digest(hashDigest);
+
+        return fullContentHash.toString().slice(0, hashDigestLength);
+      };
+      // Consume collected rules and emit the stylex CSS asset
+      compilation.hooks.processAssets.tap(
+        {
+          name: PLUGIN_NAME,
+          stage: Compilation.PROCESS_ASSETS_STAGE_ADDITIONAL,
+        },
+        () => {
+          try {
+            const bundleToStylexRules = getBundleToStylexRules();
+
+            if (bundleToStylexRules) {
+              for (const bundle of Object.keys(bundleToStylexRules)) {
+                const collectedCSS = bundleToStylexRules[bundle]
+
+                // build up a content hash for the rules using webpack's configured hashing functions
+                const contentHash = getContentHash(collectedCSS);
+
+                // pretend to be a chunk so we can reuse the webpack routine to process the filename and do token replacement
+                // see https://github.com/webpack/webpack/blob/main/lib/Compilation.js#L4733
+                // see https://github.com/webpack/webpack/blob/main/lib/TemplatedPathPlugin.js#L102
+                const filename = `${bundle}.stylex.css`
                 const data = {
-                  filename: this.filename,
+                  filename: filename,
                   contentHash: contentHash,
                   chunk: {
-                    id: chunkName,
-                    name: chunkName,
+                    id: filename,
+                    name: path.parse(filename).name,
                     hash: contentHash,
                   },
                 };
 
-                // Process the filename template (replacing [name], [contenthash], etc.)
                 const { path: hashedPath, info: assetsInfo } =
-                  compilation.getPathWithInfo(this.filename, data);
-
-                // Emit the asset for this chunk
+                  compilation.getPathWithInfo(data.filename, data);
                 compilation.emitAsset(
                   hashedPath,
-                  new RawSource(chunkCSS),
+                  new RawSource(collectedCSS),
                   assetsInfo,
                 );
               }
-            } catch (e) {
-              compilation.errors.push(e);
             }
-          },
-        );
-      }
+          } catch (e) {
+            compilation.errors.push(e);
+          }
+        },
+      );
+
     });
   }
 
@@ -257,19 +219,21 @@ class StylexPlugin {
         {
           babelrc: this.babelConfig.babelrc,
           filename,
-
+          // Use TypeScript syntax plugin if the filename ends with `.ts` or `.tsx`
+          // and use the Flow syntax plugin otherwise.
           plugins: [
             ...this.babelConfig.plugins,
             path.extname(filename) === '.ts'
               ? typescriptSyntaxPlugin
               : [typescriptSyntaxPlugin, { isTSX: true }],
             jsxSyntaxPlugin,
-            this.babelPlugin],
+            this.babelPlugin,
+          ],
           presets: this.babelConfig.presets,
         },
       );
       if (metadata.stylex != null && metadata.stylex.length > 0) {
-        this.stylexRulesByChunk[filename] = metadata.stylex;
+        this.stylexRules[filename] = metadata.stylex;
         logger.debug(`Read stylex styles from ${filename}:`, metadata.stylex);
       }
       if (!this.babelConfig.babelrc) {
