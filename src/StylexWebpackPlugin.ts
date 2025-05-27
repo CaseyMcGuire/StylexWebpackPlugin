@@ -1,57 +1,64 @@
-const babel = require('@babel/core');
-const path = require('path');
-const stylexBabelPlugin = require('@stylexjs/babel-plugin');
-const webpack = require('webpack');
-const jsxSyntaxPlugin = require('@babel/plugin-syntax-jsx');
-const typescriptSyntaxPlugin = require('@babel/plugin-syntax-typescript');
-const fs = require('fs/promises');
+import {Compilation, Compiler, NormalModule, sources} from 'webpack';
+import path from "path";
+import stylexBabelPlugin from "@stylexjs/babel-plugin";
+import fs from "fs/promises";
+import {transformAsync} from "@babel/core";
 
-const { NormalModule, Compilation } = webpack;
+// @ts-ignore
+import jsxSyntaxPlugin from "@babel/plugin-syntax-jsx";
 
-const PLUGIN_NAME = 'stylex';
+// @ts-ignore
+import typescriptSyntaxPlugin from "@babel/plugin-syntax-typescript";
+import StyleXTransformObj from "@stylexjs/babel-plugin";
+import {StyleXOptions} from "@stylexjs/babel-plugin/lib/utils/state-manager";
+
+interface StylexWebpackPluginOptions {
+  dev: boolean,
+  useCSSLayers: boolean
+}
 
 const IS_DEV_ENV =
   process.env.NODE_ENV === 'development' ||
   process.env.BABEL_ENV === 'development';
 
-const { RawSource, ConcatSource } = webpack.sources;
+const PLUGIN_NAME = "stylex";
 
+export default class StylexWebpackPlugin {
 
-class StylexPlugin {
-  stylexRules = {};
-  filesInLastRun = null;
+  private fileToBundlesMap: Map<string, Set<string>>
+  private stylexRules: Map<string, string[]>
+  private stylexImports = ['stylex', '@stylexjs/stylex']
+  private babelConfig: {
+    plugins: any[],
+    presets: any[],
+    babelrc: boolean
+  }
+  private babelPlugin: [typeof StyleXTransformObj, Partial<StyleXOptions>]
 
-  constructor({
-                dev = IS_DEV_ENV,
-                appendTo,
-                filename = appendTo == null ? '[name].stylex.css' : undefined,
-                stylexImports = ['stylex', '@stylexjs/stylex'],
-                unstable_moduleResolution = { type: 'commonJS', rootDir: process.cwd() },
-                babelConfig: { plugins = [], presets = [], babelrc = false } = {},
-                useCSSLayers = false,
-                ...options
-              } /*: PluginOptions */ = {}) {
-    this.dev = dev;
-    this.babelConfig = { plugins, presets, babelrc };
-    this.stylexImports = stylexImports;
+  constructor(options: StylexWebpackPluginOptions = {
+    dev: IS_DEV_ENV,
+    useCSSLayers: false
+  }) {
+    this.fileToBundlesMap = new Map<string, Set<string>>();
+    this.stylexRules = new Map<string, string[]>(); // Missing initialization
+    this.babelConfig = {
+      plugins: [],
+      presets: [],
+      babelrc: false
+    };
     this.babelPlugin = [
       stylexBabelPlugin,
       {
-        dev,
-        unstable_moduleResolution,
-        importSources: stylexImports,
-        ...options,
-      },
+        dev: options.dev,
+      }
     ];
-    this.useCSSLayers = useCSSLayers;
   }
 
-  apply(compiler) {
+  apply(compiler: Compiler) {
     compiler.hooks.make.tap(PLUGIN_NAME, (compilation) => {
-      // Apply loader to JS modules.
       NormalModule.getCompilationHooks(compilation).loader.tap(
         PLUGIN_NAME,
-        (loaderContext, module) => {
+        (loaderContext, module: NormalModule) => {
           if (
             // .js, .jsx, .mjs, .cjs, .ts, .tsx, .mts, .cts
             /\.[mc]?[jt]sx?$/.test(path.extname(module.resource))
@@ -61,55 +68,49 @@ class StylexPlugin {
             // our loader before anything else.
             module.loaders.unshift({
               loader: path.resolve(__dirname, 'loader.js'),
-              options: { stylexPlugin: this },
+              options: {stylexPlugin: this},
+              ident: null,
+              type: null
             });
           }
-        },
-      );
-
-      // Make a list of all modules that were included in the last compilation.
-      // This might need to be tweaked if not all files are included after a change
-      compilation.hooks.finishModules.tap(PLUGIN_NAME, (modules) => {
-        this.filesInLastRun = [...modules.values()].map((m) => m.resource);
-      });
+        }
+      )
 
       compilation.hooks.afterOptimizeChunks.tap(PLUGIN_NAME, (chunks) => {
-        this.fileToBundlesMap = {}; // Reset map for each compilation
+        this.fileToBundlesMap = new Map<string, Set<string>>(); // Reset map for each compilation
 
         for (const chunk of chunks) {
           const chunkName = chunk.name || chunk.id?.toString() || `chunk-${chunk.renderedHash}`;
           if (!chunkName) continue; // Should always have a name/id/hash
           for (const module of compilation.chunkGraph.getChunkModules(chunk)) {
-            if (module.resource) {
-              const filePath = module.resource;
+            const normalModule = module as NormalModule
+            if (normalModule.resource) {
+              const filePath = normalModule.resource;
               const isNodeModule = filePath.includes(path.sep + 'node_modules' + path.sep);
 
               if (!isNodeModule) {
-                if (!this.fileToBundlesMap[filePath]) {
-                  this.fileToBundlesMap[filePath] = [];
+                if (!this.fileToBundlesMap.get(filePath)) {
+                  this.fileToBundlesMap.set(filePath, new Set<string>());
                 }
                 // Add bundle name to the file's list if not already present
-                if (!this.fileToBundlesMap[filePath].includes(chunkName)) {
-                  this.fileToBundlesMap[filePath].push(chunkName);
+                if (!this.fileToBundlesMap.get(filePath)!.has(chunkName)) {
+                  this.fileToBundlesMap.get(filePath)!.add(chunkName);
                 }
               }
             }
           }
         }
-        // You can log it here for debugging if needed:
-        //console.log('File to Bundles Map (excluding node_modules):', this.fileToBundlesMap);
       });
 
       const getBundleToStylexRules = () => {
-        const { stylexRules } = this;
-        if (Object.keys(stylexRules).length === 0) {
+
+        if (this.stylexRules.size === 0) {
           return null;
         }
-        // Take styles for the modules that were included in the last compilation.
 
-        const bundleToRules = {};
-        for (const filename in stylexRules) {
-          const bundles = this.fileToBundlesMap[filename]
+        const bundleToRules: { [key: string]: any } = {};
+        for (const filename of this.stylexRules.keys()) {
+          const bundles = this.fileToBundlesMap.get(filename)
           if (bundles == null) {
             continue
           }
@@ -117,16 +118,16 @@ class StylexPlugin {
             if (!bundleToRules[bundle]) {
               bundleToRules[bundle] = []
             }
-            bundleToRules[bundle].push(...stylexRules[filename])
+            bundleToRules[bundle].push(...this.stylexRules.get(filename)!!)
           }
         }
 
-        const bundleToProcessedRules = {}
+        const bundleToProcessedRules: Record<string, string> = {}
         for (const bundle in bundleToRules) {
           bundleToProcessedRules[bundle] =
             stylexBabelPlugin.processStylexRules(
               bundleToRules[bundle],
-              this.useCSSLayers,
+              false,
             );
         }
 
@@ -137,11 +138,11 @@ class StylexPlugin {
       // If the filename contains replacement tokens, like [contenthash], we need to
       // process those tokens ourselves. Webpack does provide a way to reuse the configured
       // hashing functions. We'll take advantage of that to process tokens.
-      const getContentHash = (source) => {
-        const { outputOptions } = compilation;
-        const { hashDigest, hashDigestLength, hashFunction, hashSalt } =
+      const getContentHash = (source: string) => {
+        const {outputOptions} = compilation;
+        const {hashDigest, hashDigestLength, hashFunction, hashSalt} =
           outputOptions;
-        const hash = compiler.webpack.util.createHash(hashFunction);
+        const hash = compiler.webpack.util.createHash(hashFunction!);
 
         if (hashSalt) {
           hash.update(hashSalt);
@@ -153,7 +154,8 @@ class StylexPlugin {
 
         return fullContentHash.toString().slice(0, hashDigestLength);
       };
-      // Consume collected rules and emit the stylex CSS asset
+
+      // Consume collected rules and emit the stylex CSS assets
       compilation.hooks.processAssets.tap(
         {
           name: PLUGIN_NAME,
@@ -184,11 +186,11 @@ class StylexPlugin {
                   },
                 };
 
-                const { path: hashedPath, info: assetsInfo } =
+                const {path: hashedPath, info: assetsInfo} =
                   compilation.getPathWithInfo(data.filename, data);
                 compilation.emitAsset(
                   hashedPath,
-                  new RawSource(collectedCSS),
+                  new sources.RawSource(collectedCSS),
                   assetsInfo,
                 );
               }
@@ -198,21 +200,19 @@ class StylexPlugin {
           }
         },
       );
+    })
 
-    });
   }
 
-  // This function is not called by Webpack directly.
-  // Instead, `NormalModule.getCompilationHooks` is used to inject a loader
-  // for JS modules. The loader than calls this function.
-  async transformCode(inputCode, filename, logger) {
+  async transformCode(inputCode: string, filename: string, logger: { debug: (arg0: string, arg1: any) => void; }) {
     if (
       this.stylexImports.some((importName) => inputCode.includes(importName))
     ) {
       const originalSource = this.babelConfig.babelrc
         ? await fs.readFile(filename, 'utf8')
         : inputCode;
-      const { code, map, metadata } = await babel.transformAsync(
+
+      const result = await transformAsync(
         originalSource,
         {
           babelrc: this.babelConfig.babelrc,
@@ -230,9 +230,18 @@ class StylexPlugin {
           presets: this.babelConfig.presets,
         },
       );
-      if (metadata.stylex != null && metadata.stylex.length > 0) {
-        this.stylexRules[filename] = metadata.stylex;
-        logger.debug(`Read stylex styles from ${filename}:`, metadata.stylex);
+
+      if (result == null) {
+        logger.debug(`No result from compilation`, originalSource)
+        throw new Error("Failed compilation")
+      }
+      const { code, map, metadata } = result
+      // @ts-ignore
+      const stylexMetadata = metadata.stylex
+
+      if (stylexMetadata != null && stylexMetadata.length > 0) {
+        this.stylexRules.set(filename, stylexMetadata);
+        logger.debug(`Read stylex styles from ${filename}:`, stylexMetadata);
       }
       if (!this.babelConfig.babelrc) {
         return { code, map };
@@ -241,5 +250,3 @@ class StylexPlugin {
     return { code: inputCode };
   }
 }
-
-module.exports = StylexPlugin;
